@@ -3,7 +3,7 @@
 #include <LowPower.h>
 #include "sprinkler_controller.h" // Defines SECRET_AES
 
-#define DEBUG
+// #define DEBUG
 
 /**
  * Message format:
@@ -34,7 +34,10 @@ static const char CHAR_GET = 'G';
 static const char CHAR_SET = 'S';
 static const char CHAR_SEP = '.';
 
-static const unsigned long MAX_ON_DURATION = 30 /* min */ * 60 /* s/min */ * 1e3 /* ms/s */;
+static const unsigned long MAX_ON_DURATION_MS = 30 /* min */ * 60 /* s/min */ * 1e3 /* ms/s */;
+static const uint8_t NUM_RETRIES              = 3;
+static const uint8_t INTERVAL_RETRY_MS        = 100 /* ms */;
+static const unsigned long SLEEP_DELAY_MS     = 1 /* s */ * 1e3 /* ms/s */;
 
 class RelayController {
 
@@ -104,20 +107,19 @@ void setup() {
 	// Initialize radio
 	radio.initialize(FREQUENCY, ID_NODE, ID_NETWORK);
 	radio.promiscuous(true);
-	radio.setHighPower(false);
 	radio.encrypt(AES_ENCRYPT_KEY);
-
-	radio.readAllRegs();
+	radio.setPowerLevel(1, 0x10); // -2 dBm
 
 }
 
 void loop() {
 
-	static bool report_status = true;
+	bool report_status = false;
+	static bool is_quiet = false;
+	static unsigned long t_quiet_start = millis();
 
 	// Receive message
-	// if (radio.receiveDone() && radio.SENDERID == ID_CENTRAL) {
-	if (radio.receiveDone()) {
+	if (radio.receiveDone() && radio.SENDERID == ID_CENTRAL) {
 		// Return acknowledgement
 		if (radio.ACKRequested()) radio.sendACK();
 #ifdef DEBUG
@@ -132,29 +134,47 @@ void loop() {
 
 		// Parse message
 		report_status = controller.parse_message(radio.DATA);
-	} else if (!report_status && !controller.relay_is_on()) {
-		LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+		is_quiet = false;
 	}
 
 	// Check timers
 	controller.check_timers();
 
 	// Send status
-#ifdef DEBUG
 	if (report_status) {
+#ifdef DEBUG
 		Serial.print("Send status ");
 		Serial.print(controller.status_relay);
 		Serial.print(" to node ");
 		Serial.print(ID_CENTRAL, DEC);
 		Serial.println(".");
-	}
 #endif
 
-	// delay(100);
-	if (report_status && radio.sendWithRetry(ID_CENTRAL, controller.status_relay, NUM_RELAYS + 1, 3, 100)) {
-		report_status = false;
-	} else {
-		report_status = false;
+		radio.sendWithRetry(ID_CENTRAL, controller.status_relay, NUM_RELAYS + 1, NUM_RETRIES, INTERVAL_RETRY_MS);
+	}
+
+	// Check if busy
+	if (!controller.relay_is_on()) {
+
+		if (!is_quiet) {
+			// Initialize quiet period
+			is_quiet = true;
+			t_quiet_start = millis();
+
+#ifdef DEBUG
+			Serial.println("Power down?");
+#endif
+		} else if (millis() - t_quiet_start > SLEEP_DELAY_MS) {
+			// Put to sleep
+			LowPower.powerDown(SLEEP_FOREVER, ADC_OFF, BOD_OFF);
+
+			// Wake up
+			is_quiet = false;
+#ifdef DEBUG
+			Serial.println("Power up.");
+#endif
+		}
+
 	}
 
 }
@@ -286,7 +306,7 @@ bool RelayController::parse_on_duration(const char **p_message, unsigned long *r
 	unsigned long duration;
 	int num_filled = sscanf(message, "%lu.", &duration);
 	if (num_filled < 1) return false;
-	if (duration == 0 || duration > MAX_ON_DURATION) duration = MAX_ON_DURATION;
+	if (duration == 0 || duration > MAX_ON_DURATION_MS) duration = MAX_ON_DURATION_MS;
 
 	// Find position of CHAR_SEP
 	message = strchr(message, CHAR_SEP);
